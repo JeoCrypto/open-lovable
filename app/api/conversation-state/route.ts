@@ -59,10 +59,26 @@ export async function POST(request: NextRequest) {
       case 'clear-old':
         // Clear old conversation data but keep recent context
         if (!global.conversationState) {
+          // Initialize a new conversation state if none exists
+          global.conversationState = {
+            conversationId: `conv-${Date.now()}`,
+            startedAt: Date.now(),
+            lastUpdated: Date.now(),
+            context: {
+              messages: [],
+              edits: [],
+              projectEvolution: { majorChanges: [] },
+              userPreferences: {}
+            }
+          };
+          
+          console.log('[conversation-state] Created new conversation state');
+          
           return NextResponse.json({
-            success: false,
-            error: 'No active conversation to clear'
-          }, { status: 400 });
+            success: true,
+            message: 'New conversation state created',
+            state: global.conversationState
+          });
         }
         
         // Keep only recent data

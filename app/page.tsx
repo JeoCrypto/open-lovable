@@ -22,6 +22,11 @@ import {
 } from '@/lib/icons';
 import { motion, AnimatePresence } from 'framer-motion';
 import CodeApplicationProgress, { type CodeApplicationState } from '@/components/CodeApplicationProgress';
+import { CodeEditor } from '@/components/code-editor';
+import { ProjectPersistence } from '@/lib/project-persistence';
+import { SandboxWarning } from '@/components/sandbox-warning';
+import { ContentCleaner } from '@/lib/content-cleaner';
+import { FileUpload, type UploadedFile } from '@/components/file-upload';
 
 interface SandboxData {
   sandboxId: string;
@@ -85,6 +90,10 @@ export default function AISandboxPage() {
   const [loadingStage, setLoadingStage] = useState<'gathering' | 'planning' | 'generating' | null>(null);
   const [sandboxFiles, setSandboxFiles] = useState<Record<string, string>>({});
   const [fileStructure, setFileStructure] = useState<string>('');
+  const [isEditMode, setIsEditMode] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [showFileUpload, setShowFileUpload] = useState(false);
+  const [hasProject, setHasProject] = useState(false);
   
   const [conversationContext, setConversationContext] = useState<{
     scrapedWebsites: Array<{ url: string; content: any; timestamp: Date }>;
@@ -133,6 +142,21 @@ export default function AISandboxPage() {
     files: [],
     lastProcessedPosition: 0
   });
+
+  // Auto-save project files whenever they change
+  useEffect(() => {
+    if (generationProgress.files.length > 0) {
+      console.log('[ProjectPersistence] Auto-saving project files...');
+      ProjectPersistence.saveFiles(
+        generationProgress.files.map(file => ({
+          path: file.path,
+          content: file.content,
+          type: file.type
+        }))
+      );
+      setHasProject(true);
+    }
+  }, [generationProgress.files]);
 
   // Clear old conversation data on component mount and create/restore sandbox
   useEffect(() => {
@@ -204,6 +228,13 @@ export default function AISandboxPage() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [showHomeScreen]);
+
+  // Check for saved project to avoid hydration issues
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setHasProject(ProjectPersistence.hasProject());
+    }
+  }, []);
   
   // Start capturing screenshot if URL is provided on mount (from home screen)
   useEffect(() => {
@@ -256,6 +287,70 @@ export default function AISandboxPage() {
       }
       return [...prev, { content, type, timestamp: new Date(), metadata }];
     });
+  };
+  
+  const handleFileSave = async (filePath: string, content: string): Promise<void> => {
+    if (!sandboxData) {
+      throw new Error('No active sandbox');
+    }
+    
+    try {
+      // Update the file in the generation progress
+      setGenerationProgress(prev => ({
+        ...prev,
+        files: prev.files.map(file => 
+          file.path === filePath 
+            ? { ...file, content } 
+            : file
+        )
+      }));
+      
+      // Save to sandbox files state
+      setSandboxFiles(prev => ({
+        ...prev,
+        [filePath]: content
+      }));
+      
+      // Format the content as the API expects
+      const fileContent = `<file path="${filePath}">
+${content}
+</file>`;
+      
+      // Apply the changes to the sandbox
+      const applyResponse = await fetch('/api/apply-ai-code-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          response: fileContent,  // Changed from generatedCode to response
+          isEdit: true,
+          packages: [],
+          sandboxId: sandboxData.sandboxId
+        })
+      });
+      
+      if (!applyResponse.ok) {
+        const errorData = await applyResponse.text();
+        console.error('Apply API error:', errorData);
+        throw new Error('Failed to apply changes to sandbox');
+      }
+      
+      // Restart the sandbox to see changes
+      const restartResponse = await fetch('/api/restart-vite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sandboxId: sandboxData.sandboxId })
+      });
+      
+      if (!restartResponse.ok) {
+        console.error('Failed to restart Vite');
+      }
+      
+      addChatMessage(`✅ File ${filePath} updated successfully`, 'system');
+    } catch (error) {
+      console.error('Failed to save file:', error);
+      addChatMessage(`❌ Failed to save ${filePath}: ${error}`, 'error');
+      throw error;
+    }
   };
   
   const checkAndInstallPackages = async () => {
@@ -393,6 +488,50 @@ export default function AISandboxPage() {
         log('Sandbox created successfully!');
         log(`Sandbox ID: ${data.sandboxId}`);
         log(`URL: ${data.url}`);
+        
+        // Check if there's a saved project to restore
+        const savedProject = ProjectPersistence.loadProject();
+        if (savedProject && savedProject.files && Array.isArray(savedProject.files) && savedProject.files.length > 0) {
+          console.log('[createSandbox] Found saved project with', savedProject.files.length, 'files, restoring...');
+          addChatMessage('🔄 Restoring your previous project...', 'system');
+          
+          try {
+            const restoreResponse = await fetch('/api/restore-project', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                files: savedProject.files,
+                packages: savedProject.packages,
+                sandboxId: data.sandboxId
+              })
+            });
+            
+            if (restoreResponse.ok) {
+              const restoreResult = await restoreResponse.json();
+              console.log('[createSandbox] Project restored:', restoreResult);
+              
+              // Update generation progress with restored files
+              setGenerationProgress(prev => ({
+                ...prev,
+                files: savedProject.files.map(file => ({
+                  ...file,
+                  completed: true
+                }))
+              }));
+              
+              addChatMessage(`✅ Restored ${savedProject.files.length} files from your previous session`, 'system');
+            } else {
+              const errorText = await restoreResponse.text().catch(() => 'Unknown error');
+              console.error('[createSandbox] Failed to restore project:', restoreResponse.status, errorText);
+              addChatMessage('⚠️ Could not restore previous project, starting fresh', 'system');
+            }
+          } catch (error) {
+            console.error('[createSandbox] Error restoring project:', error);
+            addChatMessage('⚠️ Could not restore previous project, starting fresh', 'system');
+          }
+        } else {
+          console.log('[createSandbox] No saved project found or empty files array');
+        }
         
         // Update URL with sandbox ID
         const newParams = new URLSearchParams(searchParams.toString());
@@ -1120,51 +1259,87 @@ Tip: I automatically detect and install npm packages from your code imports (lik
             
             {/* Live Code Display */}
             <div className="flex-1 rounded-lg p-6 flex flex-col min-h-0 overflow-hidden">
+              {/* Edit Mode Toggle */}
+              <div className="flex justify-end mb-4">
+                <button
+                  onClick={() => setIsEditMode(!isEditMode)}
+                  className={`px-4 py-2 rounded-lg font-medium transition-all ${
+                    isEditMode 
+                      ? 'bg-green-600 text-white hover:bg-green-700' 
+                      : 'bg-gray-700 text-white hover:bg-gray-600'
+                  }`}
+                >
+                  {isEditMode ? '✏️ Edit Mode ON' : '👁️ View Mode'}
+                </button>
+              </div>
+              
               <div className="flex-1 overflow-y-auto min-h-0 scrollbar-hide" ref={codeDisplayRef}>
                 {/* Show selected file if one is selected */}
                 {selectedFile ? (
                   <div className="animate-in fade-in slide-in-from-top-2 duration-300">
-                    <div className="bg-black border border-gray-200 rounded-lg overflow-hidden shadow-sm">
-                      <div className="px-4 py-2 bg-[#36322F] text-white flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          {getFileIcon(selectedFile)}
-                          <span className="font-mono text-sm">{selectedFile}</span>
+                    {isEditMode ? (
+                      // Use CodeEditor in edit mode
+                      <CodeEditor
+                        key={selectedFile}
+                        initialCode={(() => {
+                          const file = generationProgress.files.find(f => f.path === selectedFile);
+                          return file?.content || '// File content will appear here';
+                        })()}
+                        language={(() => {
+                          const ext = selectedFile.split('.').pop()?.toLowerCase();
+                          if (ext === 'css') return 'css';
+                          if (ext === 'json') return 'json';
+                          if (ext === 'html') return 'html';
+                          return 'jsx';
+                        })()}
+                        fileName={selectedFile}
+                        onSave={(content) => handleFileSave(selectedFile, content)}
+                        readOnly={false}
+                      />
+                    ) : (
+                      // Use SyntaxHighlighter in view mode
+                      <div className="bg-black border border-gray-200 rounded-lg overflow-hidden shadow-sm">
+                        <div className="px-4 py-2 bg-[#36322F] text-white flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            {getFileIcon(selectedFile)}
+                            <span className="font-mono text-sm">{selectedFile}</span>
+                          </div>
+                          <button
+                            onClick={() => setSelectedFile(null)}
+                            className="hover:bg-black/20 p-1 rounded transition-colors"
+                          >
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                          </button>
                         </div>
-                        <button
-                          onClick={() => setSelectedFile(null)}
-                          className="hover:bg-black/20 p-1 rounded transition-colors"
-                        >
-                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                          </svg>
-                        </button>
+                        <div className="bg-gray-900 border border-gray-700 rounded">
+                          <SyntaxHighlighter
+                            language={(() => {
+                              const ext = selectedFile.split('.').pop()?.toLowerCase();
+                              if (ext === 'css') return 'css';
+                              if (ext === 'json') return 'json';
+                              if (ext === 'html') return 'html';
+                              return 'jsx';
+                            })()}
+                            style={vscDarkPlus}
+                            customStyle={{
+                              margin: 0,
+                              padding: '1rem',
+                              fontSize: '0.875rem',
+                              background: 'transparent',
+                            }}
+                            showLineNumbers={true}
+                          >
+                            {(() => {
+                              // Find the file content from generated files
+                              const file = generationProgress.files.find(f => f.path === selectedFile);
+                              return file?.content || '// File content will appear here';
+                            })()}
+                          </SyntaxHighlighter>
+                        </div>
                       </div>
-                      <div className="bg-gray-900 border border-gray-700 rounded">
-                        <SyntaxHighlighter
-                          language={(() => {
-                            const ext = selectedFile.split('.').pop()?.toLowerCase();
-                            if (ext === 'css') return 'css';
-                            if (ext === 'json') return 'json';
-                            if (ext === 'html') return 'html';
-                            return 'jsx';
-                          })()}
-                          style={vscDarkPlus}
-                          customStyle={{
-                            margin: 0,
-                            padding: '1rem',
-                            fontSize: '0.875rem',
-                            background: 'transparent',
-                          }}
-                          showLineNumbers={true}
-                        >
-                          {(() => {
-                            // Find the file content from generated files
-                            const file = generationProgress.files.find(f => f.path === selectedFile);
-                            return file?.content || '// File content will appear here';
-                          })()}
-                        </SyntaxHighlighter>
-                      </div>
-                    </div>
+                    )}
                   </div>
                 ) : /* If no files parsed yet, show loading or raw stream */
                 generationProgress.files.length === 0 && !generationProgress.currentFile ? (
@@ -1549,7 +1724,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: message,
+          prompt: message + getUploadedFilesContext(),
           model: aiModel,
           context: fullContext,
           isEdit: conversationContext.appliedCode.length > 0
@@ -1627,7 +1802,14 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                     
                     while ((match = fileRegex.exec(newStreamedCode)) !== null) {
                       const filePath = match[1];
-                      const fileContent = match[2];
+                      let fileContent = match[2];
+                      
+                      // Clean debug output from file content
+                      if (filePath.endsWith('.jsx') || filePath.endsWith('.js')) {
+                        fileContent = ContentCleaner.cleanJSXContent(fileContent);
+                      } else {
+                        fileContent = ContentCleaner.cleanCodeContent(fileContent);
+                      }
                       
                       // Only add if we haven't processed this file yet
                       if (!processedFiles.has(filePath)) {
@@ -1663,6 +1845,15 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                             edited: false
                           }];
                         }
+                        
+                        // Immediately save this file to persistence during streaming
+                        console.log('[ProjectPersistence] Saving file during streaming:', filePath);
+                        ProjectPersistence.saveFiles([{
+                          path: filePath,
+                          content: fileContent.trim(),
+                          type: fileType
+                        }]);
+                        setHasProject(true);
                         
                         // Only show file status if not in edit mode
                         if (!prev.isEdit) {
@@ -1755,7 +1946,15 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                   
                   while ((fileMatch = fileRegex.exec(data.generatedCode)) !== null) {
                     const filePath = fileMatch[1];
-                    const fileContent = fileMatch[2];
+                    let fileContent = fileMatch[2];
+                    
+                    // Clean debug output from file content
+                    if (filePath.endsWith('.jsx') || filePath.endsWith('.js')) {
+                      fileContent = ContentCleaner.cleanJSXContent(fileContent);
+                    } else {
+                      fileContent = ContentCleaner.cleanCodeContent(fileContent);
+                    }
+                    
                     const fileExt = filePath.split('.').pop() || '';
                     const fileType = fileExt === 'jsx' || fileExt === 'js' ? 'javascript' :
                                     fileExt === 'css' ? 'css' :
@@ -1879,6 +2078,44 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     }
   };
 
+  // File upload handlers
+  const handleFilesUploaded = (newFiles: UploadedFile[]) => {
+    setUploadedFiles(prev => [...prev, ...newFiles]);
+    
+    // Add chat message to show uploaded files
+    const fileNames = newFiles.map(f => f.name).join(', ');
+    addChatMessage(`📎 Uploaded ${newFiles.length} file(s): ${fileNames}`, 'system');
+    
+    // If any files have content (PDFs, text files), add them to conversation context
+    newFiles.forEach(file => {
+      if (file.content) {
+        addChatMessage(`📄 Extracted text from ${file.name}:\n\`\`\`\n${file.content.slice(0, 1000)}${file.content.length > 1000 ? '...' : ''}\n\`\`\``, 'system');
+      }
+    });
+  };
+
+  const handleFileRemove = (fileId: string) => {
+    setUploadedFiles(prev => prev.filter(f => f.id !== fileId));
+    const removedFile = uploadedFiles.find(f => f.id === fileId);
+    if (removedFile) {
+      addChatMessage(`🗑️ Removed file: ${removedFile.name}`, 'system');
+    }
+  };
+
+  const getUploadedFilesContext = (): string => {
+    if (uploadedFiles.length === 0) return '';
+    
+    let context = '\n\nUploaded files available for reference:\n';
+    uploadedFiles.forEach(file => {
+      context += `\n- ${file.name} (${file.type})`;
+      if (file.content) {
+        context += `:\n\`\`\`\n${file.content}\n\`\`\`\n`;
+      } else if (file.url) {
+        context += ` - Available at: ${file.url}`;
+      }
+    });
+    return context;
+  };
 
   const downloadZip = async () => {
     if (!sandboxData) {
@@ -2564,7 +2801,14 @@ Focus on the key sections and content, making it clean and modern.`;
                     
                     while ((match = fileRegex.exec(newStreamedCode)) !== null) {
                       const filePath = match[1];
-                      const fileContent = match[2];
+                      let fileContent = match[2];
+                      
+                      // Clean debug output from file content
+                      if (filePath.endsWith('.jsx') || filePath.endsWith('.js')) {
+                        fileContent = ContentCleaner.cleanJSXContent(fileContent);
+                      } else {
+                        fileContent = ContentCleaner.cleanCodeContent(fileContent);
+                      }
                       
                       // Only add if we haven't processed this file yet
                       if (!processedFiles.has(filePath)) {
@@ -2600,6 +2844,15 @@ Focus on the key sections and content, making it clean and modern.`;
                             edited: false
                           }];
                         }
+                        
+                        // Immediately save this file to persistence during streaming
+                        console.log('[ProjectPersistence] Saving file during streaming:', filePath);
+                        ProjectPersistence.saveFiles([{
+                          path: filePath,
+                          content: fileContent.trim(),
+                          type: fileType
+                        }]);
+                        setHasProject(true);
                         
                         // Only show file status if not in edit mode
                         if (!prev.isEdit) {
@@ -2786,11 +3039,9 @@ Focus on the key sections and content, making it clean and modern.`;
           
           {/* Header */}
           <div className="absolute top-0 left-0 right-0 z-20 px-6 py-4 flex items-center justify-between animate-[fadeIn_0.8s_ease-out]">
-            <img
-              src="/firecrawl-logo-with-fire.webp"
-              alt="Firecrawl"
-              className="h-8 w-auto"
-            />
+            <div className="text-xl font-bold text-white">
+              Open Lovable
+            </div>
             <a 
               href="https://github.com/mendableai/open-lovable" 
               target="_blank" 
@@ -3003,11 +3254,9 @@ Focus on the key sections and content, making it clean and modern.`;
       
       <div className="bg-card px-4 py-4 border-b border-border flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <img
-            src="/firecrawl-logo-with-fire.webp"
-            alt="Firecrawl"
-            className="h-8 w-auto"
-          />
+          <div className="text-xl font-bold text-gray-800">
+            Open Lovable
+          </div>
         </div>
         <div className="flex items-center gap-2">
           {/* Model Selector - Left side */}
@@ -3041,6 +3290,67 @@ Focus on the key sections and content, making it clean and modern.`;
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
             </svg>
           </Button>
+          
+          {/* Project Management Buttons */}
+          <div className="flex items-center gap-2 ml-2 pl-2 border-l border-gray-300">
+            <Button
+              variant="code"
+              onClick={() => ProjectPersistence.exportProject()}
+              size="sm"
+              title="Export project"
+              disabled={!hasProject}
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+            </Button>
+            
+            <Button
+              variant="code"
+              onClick={() => {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json';
+                input.onchange = async (e) => {
+                  const file = (e.target as HTMLInputElement).files?.[0];
+                  if (file) {
+                    const success = await ProjectPersistence.importProject(file);
+                    if (success) {
+                      setHasProject(true);
+                      addChatMessage('✅ Project imported successfully. Create a new sandbox to load it.', 'system');
+                    } else {
+                      addChatMessage('❌ Failed to import project', 'error');
+                    }
+                  }
+                };
+                input.click();
+              }}
+              size="sm"
+              title="Import project"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+              </svg>
+            </Button>
+            
+            <Button
+              variant="code"
+              onClick={() => {
+                if (confirm('Are you sure you want to clear the saved project? This cannot be undone.')) {
+                  ProjectPersistence.clearProject();
+                  setHasProject(false);
+                  addChatMessage('🗑️ Saved project cleared', 'system');
+                }
+              }}
+              size="sm"
+              title="Clear saved project"
+              disabled={!hasProject}
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+            </Button>
+          </div>
           <Button 
             variant="code"
             onClick={reapplyLastGeneration}
@@ -3308,9 +3618,30 @@ Focus on the key sections and content, making it clean and modern.`;
           </div>
 
           <div className="p-4 border-t border-border bg-card">
+            {/* File Upload Section */}
+            <AnimatePresence>
+              {showFileUpload && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="mb-4"
+                >
+                  <FileUpload
+                    onFilesUploaded={handleFilesUploaded}
+                    onFileRemove={handleFileRemove}
+                    uploadedFiles={uploadedFiles}
+                    maxFiles={5}
+                    maxFileSize={10}
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             <div className="relative">
               <Textarea
-                className="min-h-[60px] pr-12 resize-y border-2 border-black focus:outline-none"
+                className="min-h-[60px] pr-20 resize-y border-2 border-black focus:outline-none"
                 placeholder=""
                 value={aiChatInput}
                 onChange={(e) => setAiChatInput(e.target.value)}
@@ -3322,6 +3653,22 @@ Focus on the key sections and content, making it clean and modern.`;
                 }}
                 rows={3}
               />
+              
+              {/* File Upload Toggle Button */}
+              <button
+                onClick={() => setShowFileUpload(!showFileUpload)}
+                className={`absolute right-12 bottom-2 p-2 rounded-[10px] transition-all duration-200 ${
+                  showFileUpload 
+                    ? 'bg-blue-500 text-white hover:bg-blue-600' 
+                    : 'bg-gray-200 text-gray-600 hover:bg-gray-300'
+                }`}
+                title="Toggle file upload"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                </svg>
+              </button>
+
               <button
                 onClick={sendChatMessage}
                 className="absolute right-2 bottom-2 p-2 bg-[#36322F] text-white rounded-[10px] hover:bg-[#4a4542] [box-shadow:inset_0px_-2px_0px_0px_#171310,_0px_1px_6px_0px_rgba(58,_33,_8,_58%)] hover:translate-y-[1px] hover:scale-[0.98] hover:[box-shadow:inset_0px_-1px_0px_0px_#171310,_0px_1px_3px_0px_rgba(58,_33,_8,_40%)] active:translate-y-[2px] active:scale-[0.97] active:[box-shadow:inset_0px_1px_1px_0px_#171310,_0px_1px_2px_0px_rgba(58,_33,_8,_30%)] transition-all duration-200"
@@ -3421,9 +3768,11 @@ Focus on the key sections and content, making it clean and modern.`;
         </div>
       </div>
 
-
-
-
+      {/* Sandbox Warning for expiration */}
+      <SandboxWarning 
+        sandboxId={sandboxData?.sandboxId || null}
+        onCreateNewSandbox={() => createSandbox()}
+      />
     </div>
   );
 }

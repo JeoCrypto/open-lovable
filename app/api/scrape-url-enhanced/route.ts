@@ -27,7 +27,44 @@ export async function POST(request: NextRequest) {
       }, { status: 400 });
     }
     
-    console.log('[scrape-url-enhanced] Scraping with Firecrawl:', url);
+    // Extract URL from potential user prompt
+    let extractedUrl = url;
+    
+    // Check if the input contains a URL within a larger text
+    // Improved regex to handle domains with extensions like .pt, .com, etc.
+    const urlPattern = /https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)/g;
+    const matches = url.match(urlPattern);
+    
+    if (matches && matches.length > 0) {
+      // Take the first valid URL found
+      extractedUrl = matches[0];
+      // Clean up any trailing punctuation that's not part of the URL
+      extractedUrl = extractedUrl.replace(/[,;!?\s]+$/, '');
+      console.log('[scrape-url-enhanced] Extracted URL from prompt:', extractedUrl);
+    } else {
+      // If no full URL found, check if it's just a domain without protocol
+      const domainPattern = /(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b/g;
+      const domainMatches = url.match(domainPattern);
+      if (domainMatches && domainMatches.length > 0) {
+        extractedUrl = domainMatches[0];
+        console.log('[scrape-url-enhanced] Extracted domain from prompt:', extractedUrl);
+      }
+    }
+    
+    // Validate and format URL
+    let validatedUrl = extractedUrl;
+    try {
+      if (!extractedUrl.startsWith('http://') && !extractedUrl.startsWith('https://')) {
+        validatedUrl = 'https://' + extractedUrl;
+      }
+      const urlObj = new URL(validatedUrl);
+      validatedUrl = urlObj.toString();
+    } catch (error) {
+      console.error('[scrape-url-enhanced] URL validation failed for:', extractedUrl);
+      throw new Error(`Invalid URL format. Please provide a valid URL like "https://example.com"`);
+    }
+    
+    console.log('[scrape-url-enhanced] Scraping with Firecrawl:', validatedUrl);
     
     const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY;
     if (!FIRECRAWL_API_KEY) {
@@ -42,7 +79,7 @@ export async function POST(request: NextRequest) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        url,
+        url: validatedUrl,
         formats: ['markdown', 'html'],
         waitFor: 3000,
         timeout: 30000,

@@ -28,6 +28,14 @@ const openai = createOpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Debug API key availability
+console.log('[generate-ai-code-stream] API Keys debug:', {
+  hasOpenAI: !!process.env.OPENAI_API_KEY,
+  hasGroq: !!process.env.GROQ_API_KEY,
+  hasAnthropic: !!process.env.ANTHROPIC_API_KEY,
+  hasGoogle: !!process.env.GEMINI_API_KEY
+});
+
 // Helper function to analyze user preferences from conversation history
 function analyzeUserPreferences(messages: ConversationMessage[]): {
   commonPatterns: string[];
@@ -1154,11 +1162,19 @@ CRITICAL: When files are provided in the context:
         // Determine which provider to use based on model
         const isAnthropic = model.startsWith('anthropic/');
         const isGoogle = model.startsWith('google/');
-        const isOpenAI = model.startsWith('openai/gpt-5');
+        const isOpenAI = model.startsWith('openai/');
         const modelProvider = isAnthropic ? anthropic : (isOpenAI ? openai : (isGoogle ? googleGenerativeAI : groq));
+        
+        console.log('[generate-ai-code-stream] Model routing debug:', {
+          model,
+          isAnthropic,
+          isGoogle, 
+          isOpenAI,
+          provider: isAnthropic ? 'anthropic' : (isOpenAI ? 'openai' : (isGoogle ? 'google' : 'groq'))
+        });
         const actualModel = isAnthropic ? model.replace('anthropic/', '') : 
-                           (model === 'openai/gpt-5') ? 'gpt-5' :
-                           (isGoogle ? model.replace('google/', '') : model);
+                           (isOpenAI ? model.replace('openai/', '') :
+                           (isGoogle ? model.replace('google/', '') : model));
 
         // Make streaming API call with appropriate provider
         const streamOptions: any = {
@@ -1229,8 +1245,8 @@ It's better to have 3 complete files than 10 incomplete files.`
           // We use XML tags for package detection instead
         };
         
-        // Add temperature for non-reasoning models
-        if (!model.startsWith('openai/gpt-5')) {
+        // Add temperature for non-reasoning models (reasoning models like o1 don't support temperature)
+        if (!model.includes('gpt-5') && !model.includes('o1')) {
           streamOptions.temperature = 0.7;
         }
         
@@ -1711,7 +1727,13 @@ Provide the complete file content without any truncation. Include all necessary 
           });
         }
       } finally {
-        await writer.close();
+        try {
+          if (writer && !stream.locked) {
+            await writer.close();
+          }
+        } catch (closeError) {
+          console.warn('[generate-ai-code-stream] Writer already closed or stream locked:', closeError);
+        }
       }
     })();
     
